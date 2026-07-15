@@ -45,6 +45,8 @@ import time
 import unicodedata
 import urllib.parse
 import xml.etree.ElementTree as ET
+
+import bibtexparser
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Optional
@@ -850,11 +852,306 @@ def write_report(report_path: Path, rows: list[dict[str, str]]) -> None:
         writer.writerows(rows)
 
 
+
+def parse_bibtex_file(path: Path) -> list[dict[str, str]]:
+    """Read BibTeX records using bibtexparser."""
+    with path.open("r", encoding="utf-8-sig") as handle:
+        database = bibtexparser.load(handle)
+    return database.entries
+
+
+def clean_latex_text(value: str) -> str:
+    """Convert common BibTeX/LaTeX markup to readable plain text."""
+    if not value:
+        return ""
+
+    text = value
+    replacements = {
+        r"\&": "&",
+        r"\%": "%",
+        r"\_": "_",
+        r"\#": "#",
+        r"\$": "$",
+        r"\textbackslash{}": "\\",
+        r"~": " ",
+        r"\textendash": "–",
+        r"\textemdash": "—",
+    }
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+
+    text = re.sub(r"\\(?:textit|emph|textbf|mathrm|textrm|mathbf)\s*\{([^{}]*)\}", r"\1", text)
+    text = re.sub(r"\\[A-Za-z]+\s*", "", text)
+    text = text.replace("{", "").replace("}", "")
+    return normalize_space(text)
+
+
+def split_bibtex_authors(author_field: str) -> list[str]:
+    """Split a BibTeX author field while preserving corporate authors."""
+    if not author_field:
+        return []
+    return [clean_latex_text(part) for part in re.split(r"\s+and\s+", author_field) if clean_latex_text(part)]
+
+
+def apa_person_name(name: str) -> str:
+    """
+    Convert common BibTeX person formats to APA-style family name and initials.
+
+    Examples:
+        Shakouri, Behzad -> Shakouri, B.
+        Behzad Shakouri -> Shakouri, B.
+    """
+    name = clean_latex_text(name)
+    if not name:
+        return ""
+
+    # Corporate/group author enclosed in braces in source BibTeX.
+    if len(name.split()) > 5 and "," not in name:
+        return name
+
+    if "," in name:
+        family, given = [normalize_space(part) for part in name.split(",", 1)]
+    else:
+        parts = name.split()
+        if len(parts) == 1:
+            return parts[0]
+        family = parts[-1]
+        given = " ".join(parts[:-1])
+
+    initials = []
+    for token in re.split(r"[\s\-]+", given):
+        token = re.sub(r"[^A-Za-zÀ-ÖØ-öø-ÿ]", "", token)
+        if token:
+            initials.append(f"{token[0].upper()}.")
+
+    if initials:
+        return f"{family}, {' '.join(initials)}"
+    return family
+
+
+def apa_authors(author_field: str) -> str:
+    authors = [apa_person_name(name) for name in split_bibtex_authors(author_field)]
+    authors = [name for name in authors if name]
+
+    if not authors:
+        return ""
+    if len(authors) == 1:
+        return authors[0]
+    if len(authors) == 2:
+        return f"{authors[0]}, & {authors[1]}"
+    if len(authors) <= 20:
+        return ", ".join(authors[:-1]) + f", & {authors[-1]}"
+
+    # APA 7: list first 19, ellipsis, then final author.
+    return ", ".join(authors[:19]) + f", … {authors[-1]}"
+
+
+def sentence_case_title(title: str) -> str:
+    """
+    Apply conservative sentence case without aggressively lowercasing acronyms.
+    BibTeX-protected capitalization is preserved only approximately after braces
+    are removed, so words written fully in capitals remain unchanged.
+    """
+    title = clean_latex_text(title)
+    if not title:
+        return ""
+
+    words = title.split()
+    result = []
+    capitalize_next = True
+
+    for word in words:
+        if word.isupper() and len(word) > 1:
+            result.append(word)
+        elif capitalize_next:
+            result.append(word[:1].upper() + word[1:])
+            capitalize_next = False
+        else:
+            result.append(word)
+
+        if word.endswith((':', '?', '!')):
+            capitalize_next = True
+
+    return " ".join(result)
+
+
+def ensure_terminal_period(text: str) -> str:
+    text = normalize_space(text)
+    if not text:
+        return ""
+    return text if text[-1] in ".?!" else text + "."
+
+
+def apa_reference(entry: dict[str, str], include_doi_url: bool = True) -> str:
+    """Create an APA 7-like plain-text reference for common BibTeX types."""
+    entry_type = entry.get("ENTRYTYPE", "misc").lower()
+    author_text = apa_authors(entry.get("author", ""))
+    year = clean_latex_text(entry.get("year", "")) or "n.d."
+    title = sentence_case_title(entry.get("title", ""))
+
+    lead = f"{author_text} ({year})." if author_text else f"({year})."
+    title_part = ensure_terminal_period(title)
+
+    doi = normalize_doi(clean_latex_text(entry.get("doi", "")))
+    url = clean_latex_text(entry.get("url", ""))
+    doi_url = f"https://doi.org/{doi}" if doi else ""
+    final_url = doi_url if doi_url and include_doi_url else url
+
+    if entry_type == "article":
+        journal = clean_latex_text(entry.get("journal", ""))
+        volume = clean_latex_text(entry.get("volume", ""))
+        number = clean_latex_text(entry.get("number", entry.get("issue", "")))
+        pages = clean_latex_text(entry.get("pages", "")).replace("--", "–")
+
+        source = journal
+        if volume:
+            source += f", {volume}"
+        if number:
+            source += f"({number})"
+        if pages:
+            source += f", {pages}"
+        source = ensure_terminal_period(source)
+
+        parts = [lead, title_part, source]
+
+    elif entry_type in {"inproceedings", "conference"}:
+        booktitle = clean_latex_text(entry.get("booktitle", ""))
+        pages = clean_latex_text(entry.get("pages", "")).replace("--", "–")
+        publisher = clean_latex_text(entry.get("publisher", ""))
+
+        source = f"In {booktitle}" if booktitle else ""
+        if pages:
+            source += f" (pp. {pages})"
+        source = ensure_terminal_period(source)
+        publisher = ensure_terminal_period(publisher)
+
+        parts = [lead, title_part, source, publisher]
+
+    elif entry_type in {"incollection", "inbook"}:
+        booktitle = sentence_case_title(entry.get("booktitle", ""))
+        editor = apa_authors(entry.get("editor", ""))
+        pages = clean_latex_text(entry.get("pages", "")).replace("--", "–")
+        publisher = clean_latex_text(entry.get("publisher", ""))
+
+        source = "In "
+        if editor:
+            source += f"{editor} (Ed.), "
+        source += booktitle
+        if pages:
+            source += f" (pp. {pages})"
+        source = ensure_terminal_period(source)
+        publisher = ensure_terminal_period(publisher)
+
+        parts = [lead, title_part, source, publisher]
+
+    elif entry_type == "book":
+        edition = clean_latex_text(entry.get("edition", ""))
+        publisher = clean_latex_text(entry.get("publisher", ""))
+
+        if edition and title_part:
+            title_part = title_part[:-1] + f" ({edition} ed.)."
+
+        parts = [lead, title_part, ensure_terminal_period(publisher)]
+
+    elif entry_type in {"phdthesis", "mastersthesis"}:
+        school = clean_latex_text(entry.get("school", entry.get("institution", "")))
+        thesis_label = "Doctoral dissertation" if entry_type == "phdthesis" else "Master's thesis"
+        descriptor = f"[{thesis_label}, {school}]" if school else f"[{thesis_label}]"
+        parts = [lead, title_part, ensure_terminal_period(descriptor)]
+
+    elif entry_type == "techreport":
+        institution = clean_latex_text(entry.get("institution", ""))
+        number = clean_latex_text(entry.get("number", ""))
+        descriptor = f"Technical report"
+        if number:
+            descriptor += f" No. {number}"
+        parts = [lead, title_part, ensure_terminal_period(descriptor), ensure_terminal_period(institution)]
+
+    else:
+        howpublished = clean_latex_text(entry.get("howpublished", ""))
+        note = clean_latex_text(entry.get("note", ""))
+        parts = [lead, title_part, ensure_terminal_period(howpublished), ensure_terminal_period(note)]
+
+    reference = " ".join(part for part in parts if normalize_space(part))
+    if final_url:
+        reference += f" {final_url}"
+    return normalize_space(reference)
+
+
+def export_apa_references(
+    bib_path: Path,
+    output_path: Path,
+    *,
+    numbered: bool = False,
+    sort_mode: str = "author",
+    include_doi_url: bool = True,
+) -> int:
+    entries = parse_bibtex_file(bib_path)
+
+    if sort_mode == "author":
+        entries.sort(
+            key=lambda entry: (
+                normalize_for_match(entry.get("author", "")),
+                entry.get("year", ""),
+                normalize_for_match(entry.get("title", "")),
+            )
+        )
+    elif sort_mode == "year":
+        entries.sort(
+            key=lambda entry: (
+                entry.get("year", ""),
+                normalize_for_match(entry.get("author", "")),
+            )
+        )
+    elif sort_mode == "title":
+        entries.sort(key=lambda entry: normalize_for_match(entry.get("title", "")))
+
+    references = []
+    for index, entry in enumerate(entries, start=1):
+        text = apa_reference(entry, include_doi_url=include_doi_url)
+        if numbered:
+            text = f"{index}. {text}"
+        references.append(text)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text("\n\n".join(references) + ("\n" if references else ""), encoding="utf-8")
+    return len(references)
+
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Recursively scan PDFs and create BibTeX files."
     )
-    parser.add_argument("folder", type=Path, help="Folder containing PDF files.")
+    parser.add_argument("folder", nargs="?", type=Path, help="Folder containing PDF files.")
+    parser.add_argument(
+        "--bib-input",
+        type=Path,
+        default=None,
+        help="Read an existing .bib file instead of scanning PDFs.",
+    )
+    parser.add_argument(
+        "--apa-output",
+        type=Path,
+        default=None,
+        help="Export APA-style references to a plain-text file.",
+    )
+    parser.add_argument(
+        "--apa-numbered",
+        action="store_true",
+        help="Number APA references.",
+    )
+    parser.add_argument(
+        "--apa-sort",
+        choices=["author", "year", "title", "none"],
+        default="author",
+        help="Sort order for APA references.",
+    )
+    parser.add_argument(
+        "--no-doi-url",
+        action="store_true",
+        help="Do not append DOI URLs to APA references.",
+    )
     parser.add_argument(
         "--output",
         type=Path,
@@ -898,6 +1195,32 @@ def main() -> int:
     )
 
     args = parser.parse_args()
+
+    if args.bib_input:
+        bib_path = args.bib_input.expanduser().resolve()
+        if not bib_path.exists():
+            print(f"ERROR: BibTeX file not found: {bib_path}", file=sys.stderr)
+            return 2
+
+        apa_path = (
+            args.apa_output.expanduser().resolve()
+            if args.apa_output
+            else bib_path.with_name(f"{bib_path.stem}_APA.txt")
+        )
+
+        count = export_apa_references(
+            bib_path,
+            apa_path,
+            numbered=args.apa_numbered,
+            sort_mode=args.apa_sort,
+            include_doi_url=not args.no_doi_url,
+        )
+        print(f"Exported {count} APA-style reference(s): {apa_path}")
+        return 0
+
+    if args.folder is None:
+        parser.error("Provide a PDF folder or use --bib-input FILE.bib")
+
     root = args.folder.expanduser().resolve()
 
     if not root.exists() or not root.is_dir():
@@ -1072,6 +1395,20 @@ def main() -> int:
     print(f"Review BibTeX    : {review_path}")
     print(f"CSV report       : {report_path}")
     print(f"Unrecognized     : {unrecognized_path}")
+
+    if args.apa_output:
+        combined_path = output_path.with_name(f"{output_path.stem}_all_for_apa.bib")
+        combined_content = output_path.read_text(encoding="utf-8") + "\n" + review_path.read_text(encoding="utf-8")
+        combined_path.write_text(combined_content, encoding="utf-8")
+        apa_count = export_apa_references(
+            combined_path,
+            args.apa_output.expanduser().resolve(),
+            numbered=args.apa_numbered,
+            sort_mode=args.apa_sort,
+            include_doi_url=not args.no_doi_url,
+        )
+        combined_path.unlink(missing_ok=True)
+        print(f"APA references   : {args.apa_output.expanduser().resolve()} ({apa_count})")
 
     return 0
 
