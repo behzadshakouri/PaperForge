@@ -1,5 +1,7 @@
 # PaperForge
 
+## About
+
 **PaperForge** is an open-source toolkit for automatically extracting
 bibliographic metadata from PDF documents and generating high-quality
 reference libraries.
